@@ -1,7 +1,6 @@
 package xtype
 
 import (
-	"fmt"
 	"go/types"
 	"strings"
 
@@ -63,118 +62,13 @@ func (t *Type) AsPointerType() *types.Pointer {
 	return types.NewPointer(t.T)
 }
 
-func (t *Type) inStruct(source *Type, field string) *Type {
+func (t *Type) InStruct(source *Type, field string) *Type {
 	if t.Signature && source.Named {
 		t.FuncType = types.NewFunc(-1, source.NamedType.Obj().Pkg(), field, t.SignatureType)
 		t.Func = true
 	}
 
 	return t
-}
-
-// StructField holds the type of a struct field and its name.
-type StructField struct {
-	Path []string
-	Type *Type
-}
-
-type SimpleStructField struct {
-	Name string
-	Type *Type
-}
-
-// StructField returns the type of a struct field and its name upon successful match or
-// an error if it is not found. This method will also return a detailed error if matchIgnoreCase
-// is enabled and there are multiple non-exact matches.
-func (t Type) findAllFields(path []string, name string, ignoreCase bool) (*StructField, []*StructField) {
-	if !t.Struct {
-		panic("trying to get field of non struct")
-	}
-
-	var matches []*StructField
-	handle := func(obj types.Object) *StructField {
-		exact := obj.Name() == name
-		if exact || (ignoreCase && strings.EqualFold(obj.Name(), name)) {
-			// exact match takes precedence over case-insensitive match
-			newPath := append([]string{}, path...)
-			newPath = append(newPath, obj.Name())
-			f := &StructField{Path: newPath, Type: TypeOf(obj.Type()).inStruct(&t, obj.Name())}
-			if exact {
-				return f
-			}
-			matches = append(matches, f)
-		}
-		return nil
-	}
-
-	for y := 0; y < t.StructType.NumFields(); y++ {
-		if exact := handle(t.StructType.Field(y)); exact != nil {
-			return exact, matches
-		}
-	}
-
-	if t.Named {
-		for y := 0; y < t.NamedType.NumMethods(); y++ {
-			if exact := handle(t.NamedType.Method(y)); exact != nil {
-				return exact, matches
-			}
-		}
-	}
-
-	return nil, matches
-}
-
-type FieldSources struct {
-	Path []string
-	Type *Type
-}
-
-func FindExactField(source *Type, name string) (*SimpleStructField, error) {
-	exactMatch, _ := source.findAllFields(nil, name, false)
-	if exactMatch == nil {
-		return nil, fmt.Errorf("%q does not exist", name)
-	}
-	return &SimpleStructField{Name: exactMatch.Path[0], Type: exactMatch.Type}, nil
-}
-
-type NoMatchError struct{ Field string }
-
-func (err *NoMatchError) Error() string {
-	return fmt.Sprintf("\"%s\" does not exist", err.Field)
-}
-
-func FindField(name string, ignoreCase bool, source *Type, additionalFieldSources []FieldSources) (*StructField, error) {
-	exactMatch, ignoreCaseMatches := source.findAllFields(nil, name, ignoreCase)
-	var exactMatches []*StructField
-	if exactMatch != nil {
-		exactMatches = append(exactMatches, exactMatch)
-	}
-
-	for _, source := range additionalFieldSources {
-		sourceExactMatch, sourceIgnoreCaseMatches := source.Type.findAllFields(source.Path, name, ignoreCase)
-		if sourceExactMatch != nil {
-			exactMatches = append(exactMatches, sourceExactMatch)
-		}
-		ignoreCaseMatches = append(ignoreCaseMatches, sourceIgnoreCaseMatches...)
-	}
-
-	matches := exactMatches
-	if len(matches) == 0 {
-		matches = ignoreCaseMatches
-	}
-
-	switch len(matches) {
-	case 1:
-		return matches[0], nil
-	case 0:
-		return nil, &NoMatchError{Field: name}
-	default:
-		names := make([]string, 0, len(matches))
-		for _, m := range matches {
-			names = append(names, strings.Join(m.Path, "."))
-		}
-		return nil, ambiguousMatchError(name, names)
-	}
 }
 
 // JenID a jennifer code wrapper with extra infos.
@@ -305,14 +199,4 @@ func (t Type) TypeAsJen() *jen.Statement {
 		return toCode(t.NamedType)
 	}
 	return toCode(t.T)
-}
-
-func ambiguousMatchError(name string, ambNames []string) error {
-	return fmt.Errorf(`multiple matches found for %q. Possible matches: %s.
-
-Explicitly define the mapping via goverter:map. Example:
-
-    goverter:map %s %s
-
-See https://goverter.jmattheis.de/reference/map`, name, strings.Join(ambNames, ", "), ambNames[0], name)
 }

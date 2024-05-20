@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"go/types"
 	"strings"
@@ -17,11 +18,11 @@ type Method struct {
 	*method.Definition
 	Common
 
-	Constructor *method.Definition
-	AutoMap     []string
-	Fields      map[string]*FieldMapping
-	EnumMapping *EnumMapping
-
+	Constructor      *method.Definition
+	AutoMap          []string
+	Fields           map[string]*FieldMapping
+	EnumMapping      *EnumMapping
+	SearchConfig     SearchConfig
 	RawFieldSettings []string
 }
 
@@ -91,6 +92,19 @@ func parseMethodLine(ctx *context, c *Converter, m *Method, value string) (err e
 			}
 			f.Function, err = ctx.Loader.GetOne(c.Package, custom, opts)
 		}
+	case "searchMode":
+		parts := strings.Fields(rest)
+		if len(parts) != 2 {
+			err = errors.New(`searchMode must be formatted like so
+sourceWhere targetWhere.
+For example
+tag:json useFieldName
+useFieldName tag:bson
+tag:xml tag:xml
+`)
+		}
+		m.SearchConfig = NewSearchConfig(parts[0], parts[1])
+
 	case "ignore":
 		fieldSetting = true
 		fields := strings.Fields(rest)

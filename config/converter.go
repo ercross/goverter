@@ -15,7 +15,10 @@ const (
 var DefaultConfig = ConverterConfig{
 	OutputFile:        "./generated/generated.go",
 	OutputPackageName: "generated",
-	Common:            Common{Enum: enum.Config{Enabled: true}},
+	Common: Common{
+		Enum:         enum.Config{Enabled: true},
+		SearchConfig: SearchConfig{SearchMode: SearchModeFieldNameToFieldName},
+	},
 }
 
 type Converter struct {

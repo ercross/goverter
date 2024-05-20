@@ -1,7 +1,9 @@
 package builder
 
 import (
+	"errors"
 	"fmt"
+	"github.com/jmattheis/goverter/config"
 	"go/types"
 	"strings"
 
@@ -37,6 +39,13 @@ func (*Struct) Build(gen Generator, ctx *MethodContext, sourceID *xtype.JenID, s
 
 	definedFields := ctx.DefinedFields(target)
 	usedSourceID := false
+
+	searchConfig := ctx.Conf.Common.SearchConfig
+	if ctx.Conf.SearchConfig.SearchMode != config.SearchModeFieldNameToFieldName {
+		searchConfig = ctx.Conf.SearchConfig
+	}
+
+	// for each target field, find corresponding field in source
 	for i := 0; i < target.StructType.NumFields(); i++ {
 		targetField := target.StructType.Field(i)
 		delete(definedFields, targetField.Name())
@@ -62,10 +71,10 @@ func (*Struct) Build(gen Generator, ctx *MethodContext, sourceID *xtype.JenID, s
 
 		targetFieldType := xtype.TypeOf(targetField.Type())
 		targetFieldPath := errPath.Field(targetField.Name())
-
+		targetFieldTag := target.StructType.Tag(i)
 		if fieldMapping.Function == nil {
 			usedSourceID = true
-			nextID, nextSource, mapStmt, lift, skip, err := mapField(gen, ctx, targetField, sourceID, source, target, additionalFieldSources, targetFieldPath)
+			nextID, nextSource, mapStmt, lift, skip, err := mapField(gen, ctx, targetField, targetFieldTag, searchConfig, sourceID, source, target, additionalFieldSources, targetFieldPath)
 			if skip {
 				continue
 			}
@@ -88,7 +97,7 @@ func (*Struct) Build(gen Generator, ctx *MethodContext, sourceID *xtype.JenID, s
 			var functionCallSourceType *xtype.Type
 			if def.Source != nil {
 				usedSourceID = true
-				nextID, nextSource, mapStmt, mapLift, _, err := mapField(gen, ctx, targetField, sourceID, source, target, additionalFieldSources, targetFieldPath)
+				nextID, nextSource, mapStmt, mapLift, _, err := mapField(gen, ctx, targetField, targetFieldTag, searchConfig, sourceID, source, target, additionalFieldSources, targetFieldPath)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -138,9 +147,11 @@ func mapField(
 	gen Generator,
 	ctx *MethodContext,
 	targetField *types.Var,
+	targetFieldTag string,
+	searchConfig config.SearchConfig,
 	sourceID *xtype.JenID,
 	source, target *xtype.Type,
-	additionalFieldSources []xtype.FieldSources,
+	additionalFieldSources []FieldSources,
 	errPath ErrorPath,
 ) (*xtype.JenID, *xtype.Type, []jen.Code, []*Path, bool, *Error) {
 	lift := []*Path{}
@@ -159,12 +170,17 @@ func mapField(
 
 	var path []string
 	if pathString == "" {
-		sourceMatch, err := xtype.FindField(targetField.Name(), ctx.Conf.MatchIgnoreCase, source, additionalFieldSources)
+		t := SimpleStructField{
+			Name: targetField.Name(),
+			Type: target,
+			Tag:  targetFieldTag,
+		}
+		sourceMatch, err := FindField(t, ctx.Conf.MatchIgnoreCase, searchConfig, source, additionalFieldSources)
 		if err != nil {
 			cause := fmt.Sprintf("Cannot match the target field with the source entry: %s.", err.Error())
 			skip := false
 			if ctx.Conf.IgnoreMissing {
-				_, skip = err.(*xtype.NoMatchError)
+				_, skip = err.(*NoMatchError)
 			}
 			return nil, nil, nil, nil, skip, NewError(cause).Lift(&Path{
 				Prefix:     ".",
@@ -202,7 +218,12 @@ func mapField(
 				SourceType: "???",
 			}).Lift(lift...)
 		}
-		sourceMatch, err := xtype.FindExactField(nextSource, path[i])
+		t := SimpleStructField{
+			Name: path[i],
+			Type: target,
+			Tag:  targetFieldTag,
+		}
+		sourceMatch, err := FindExactField(nextSource, config.SearchConfig{}, t)
 		if err == nil {
 			nextSource = sourceMatch.Type
 			nextIDCode = nextIDCode.Clone().Dot(sourceMatch.Name)
@@ -288,14 +309,14 @@ func mapField(
 	return returnID, nextSource, stmt, lift, false, nil
 }
 
-func parseAutoMap(ctx *MethodContext, source *xtype.Type) ([]xtype.FieldSources, *Error) {
-	fieldSources := []xtype.FieldSources{}
+func parseAutoMap(ctx *MethodContext, source *xtype.Type) ([]FieldSources, *Error) {
+	fieldSources := []FieldSources{}
 	for _, field := range ctx.Conf.AutoMap {
 		innerSource := source
 		lift := []*Path{}
 		path := strings.Split(field, ".")
 		for _, part := range path {
-			field, err := xtype.FindExactField(innerSource, part)
+			field, err := FindExactField(innerSource, config.SearchConfig{}, SimpleStructField{Name: part})
 			if err != nil {
 				return nil, NewError(err.Error()).Lift(&Path{
 					Prefix:     ".",
@@ -320,9 +341,226 @@ func parseAutoMap(ctx *MethodContext, source *xtype.Type) ([]xtype.FieldSources,
 			}
 		}
 
-		fieldSources = append(fieldSources, xtype.FieldSources{Path: path, Type: innerSource})
+		fieldSources = append(fieldSources, FieldSources{Path: path, Type: innerSource})
 	}
 	return fieldSources, nil
+}
+
+// StructField holds the type of a struct field and its name.
+type StructField struct {
+	Path []string
+	Type *xtype.Type
+}
+
+type SimpleStructField struct {
+	Name string
+	Type *xtype.Type
+	Tag  string
+}
+
+// findFieldMatches finds fields in t that matches name, where t must be a struct
+func findFieldMatches(
+	path []string,
+	searchConfig config.SearchConfig,
+	source *xtype.Type,
+	target SimpleStructField,
+	ignoreCase bool,
+) (exactMatch *StructField, ignoreCaseMatches []*StructField) {
+
+	if !source.Struct {
+		panic("trying to get field of non struct")
+	}
+
+	if searchConfig.SearchMode != config.SearchModeFieldNameToFieldName {
+		return findFieldMatchInTags(path, searchConfig, target, source), nil
+	}
+
+	var matches []*StructField
+	handle := func(obj types.Object) *StructField {
+		isExactMatch := obj.Name() == target.Name
+		if isExactMatch || matchedOnIgnoreCase(ignoreCase, obj.Name(), target.Name) {
+			newPath := append([]string{}, path...)
+			newPath = append(newPath, obj.Name())
+			f := &StructField{Path: newPath, Type: xtype.TypeOf(obj.Type()).InStruct(source, obj.Name())}
+
+			// exactMatch takes precedence over case-insensitive match
+			if isExactMatch {
+				return f
+			}
+			matches = append(matches, f)
+		}
+		return nil
+	}
+
+	for y := 0; y < source.StructType.NumFields(); y++ {
+		if exact := handle(source.StructType.Field(y)); exact != nil {
+			return exact, matches
+		}
+	}
+
+	// find matching methods
+	if source.Named {
+		for y := 0; y < source.NamedType.NumMethods(); y++ {
+			if exact := handle(source.NamedType.Method(y)); exact != nil {
+				return exact, matches
+			}
+		}
+	}
+
+	return nil, matches
+}
+
+// findFieldMatchInTags finds field in source t that matches either
+// target.Name or searchConfig.TargetKey value, as configured by searchConfig.SearchMode,
+func findFieldMatchInTags(
+	path []string,
+	searchConfig config.SearchConfig,
+	target SimpleStructField,
+	source *xtype.Type,
+) (exactMatch *StructField) {
+
+	newStructField := func(obj types.Object) *StructField {
+		newPath := append([]string{}, path...)
+		newPath = append(newPath, obj.Name())
+		return &StructField{Path: newPath, Type: xtype.TypeOf(obj.Type()).InStruct(source, obj.Name())}
+	}
+
+	switch searchConfig.SearchMode {
+	case config.SearchModeTagToTag:
+		if searchConfig.SourceTagKey == "" || searchConfig.TargetTagKey == "" {
+			panic(errors.New("either source tag key or target tag key is empty"))
+		}
+
+		targetTagValue := extractTagKeyValue(target.Tag, searchConfig.TargetTagKey)
+		for y := 0; y < source.StructType.NumFields(); y++ {
+			sourceTagValue := extractTagKeyValue(source.StructType.Tag(y), searchConfig.SourceTagKey)
+
+			if strings.EqualFold(targetTagValue, sourceTagValue) {
+				return newStructField(source.StructType.Field(y))
+			}
+		}
+
+	case config.SearchModeFieldNameToTag:
+		if searchConfig.TargetTagKey == "" {
+			panic(errors.New("target tag key must not be empty"))
+		}
+		targetTagValue := extractTagKeyValue(target.Tag, searchConfig.TargetTagKey)
+		for y := 0; y < source.StructType.NumFields(); y++ {
+			obj := source.StructType.Field(y)
+			if strings.EqualFold(targetTagValue, obj.Name()) {
+				return newStructField(obj)
+			}
+		}
+
+	case config.SearchModeTagToFieldName:
+		if searchConfig.SourceTagKey == "" {
+			panic(errors.New("source tag must not be empty"))
+		}
+
+		for y := 0; y < source.StructType.NumFields(); y++ {
+			sourceTagValue := extractTagKeyValue(source.StructType.Tag(y), searchConfig.SourceTagKey)
+			if strings.EqualFold(target.Name, sourceTagValue) {
+				obj := source.StructType.Field(y)
+				newPath := append([]string{}, path...)
+				newPath = append(newPath, obj.Name())
+				return &StructField{Path: newPath, Type: xtype.TypeOf(obj.Type()).InStruct(source, obj.Name())}
+			}
+		}
+	default:
+		panic("unknown tag match mode")
+	}
+	return
+}
+
+// extractTagKeyValue extracts the value of key in tag.
+// For example, given a tag string `json:"first_name" bson:"firstName"`,
+// extractTagKeyValue returns first_name, if key == json
+func extractTagKeyValue(tag, key string) (value string) {
+
+	tagPairs := strings.Split(tag, " ")
+	for _, pair := range tagPairs {
+		parts := strings.Split(pair, ":")
+		if len(parts) != 2 {
+			continue
+		}
+
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		v = strings.Trim(v, `"`)
+
+		if k == key {
+			return v
+		}
+	}
+	return ""
+}
+
+func matchedOnIgnoreCase(ignoreCase bool, s1, s2 string) bool {
+	return ignoreCase && strings.EqualFold(s1, s2)
+}
+
+type FieldSources struct {
+	Path []string
+	Type *xtype.Type
+}
+
+func FindExactField(source *xtype.Type, searchConfig config.SearchConfig, target SimpleStructField) (*SimpleStructField, error) {
+	exactMatch, _ := findFieldMatches(nil, searchConfig, source, target, false)
+	if exactMatch == nil {
+		return nil, fmt.Errorf("%q does not exist", target.Name)
+	}
+	return &SimpleStructField{Name: exactMatch.Path[0], Type: exactMatch.Type}, nil
+}
+
+type NoMatchError struct{ Field string }
+
+func (err *NoMatchError) Error() string {
+	return fmt.Sprintf("\"%s\" does not exist", err.Field)
+}
+
+func FindField(target SimpleStructField, ignoreCase bool, searchConfig config.SearchConfig, source *xtype.Type, additionalFieldSources []FieldSources) (*StructField, error) {
+
+	exactMatch, ignoreCaseMatches := findFieldMatches(nil, searchConfig, source, target, ignoreCase)
+	var exactMatches []*StructField
+	if exactMatch != nil {
+		exactMatches = append(exactMatches, exactMatch)
+	}
+
+	for _, source := range additionalFieldSources {
+		sourceExactMatch, sourceIgnoreCaseMatches := findFieldMatches(source.Path, searchConfig, source.Type, target, ignoreCase)
+		if sourceExactMatch != nil {
+			exactMatches = append(exactMatches, sourceExactMatch)
+		}
+		ignoreCaseMatches = append(ignoreCaseMatches, sourceIgnoreCaseMatches...)
+	}
+
+	matches := exactMatches
+	if len(matches) == 0 {
+		matches = ignoreCaseMatches
+	}
+
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return nil, &NoMatchError{Field: target.Name}
+	default:
+		names := make([]string, 0, len(matches))
+		for _, m := range matches {
+			names = append(names, strings.Join(m.Path, "."))
+		}
+		return nil, ambiguousMatchError(target.Name, names)
+	}
+}
+
+func ambiguousMatchError(name string, ambNames []string) error {
+	return fmt.Errorf(`multiple matches found for %q. Possible matches: %s.
+
+Explicitly define the mapping via goverter:map. Example:
+
+    goverter:map %s %s
+
+See https://goverter.jmattheis.de/reference/map`, name, strings.Join(ambNames, ", "), ambNames[0], name)
 }
 
 func unexportedStructError(targetField, sourceType, targetType string) string {
